@@ -495,7 +495,59 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	pushConds := make([]expression.Expression, 0, len(sel.Conditions))
+	restConds := make([]expression.Expression, 0, len(sel.Conditions))
+	groupCols := agg.GetGroupByCols()
+	ctx := sel.SCtx()
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			pushConds = append(pushConds, cond)
+			restConds = append(restConds, cond)
+		case *expression.ScalarFunction:
+			cols := expression.ExtractColumns(cond)
+			canPush := true
+			for _, col := range cols {
+				isExist := false
+				for _, c := range groupCols {
+					if col.Equal(ctx, c) {
+						isExist = true
+						break
+					}
+				}
+				if !isExist {
+					canPush = false
+					break
+				}
+			}
+			if canPush {
+				pushConds = append(pushConds, cond)
+			} else {
+				restConds = append(restConds, cond)
+			}
+		default:
+			restConds = append(restConds, cond)
+		}
+	}
+	if len(pushConds) == 0 {
+		return nil, false, false, nil
+	}
+	pushSel := plannercore.LogicalSelection{Conditions: pushConds}.Init(ctx)
+	pushGroupExpr := memo.NewGroupExpr(pushSel)
+	pushGroupExpr.SetChildren(old.Children[0].GetExpr().Children[0])
+	pushGroup := memo.NewGroupWithSchema(pushGroupExpr, old.Children[0].GetExpr().Children[0].Prop.Schema)
+	newAggGroupExpr := memo.NewGroupExpr(agg)
+	newAggGroupExpr.SetChildren(pushGroup)
+	if len(restConds) == 0 {
+		return []*memo.GroupExpr{newAggGroupExpr}, true, false, nil
+	}
+	newAggGroup := memo.NewGroupWithSchema(newAggGroupExpr, old.Children[0].Prop.Schema)
+	newSel := plannercore.LogicalSelection{Conditions: restConds}.Init(ctx)
+	newPushGroupExpr := memo.NewGroupExpr(newSel)
+	newPushGroupExpr.SetChildren(newAggGroup)
+	return []*memo.GroupExpr{newPushGroupExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -798,5 +850,26 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	aggPlan := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	projPlan := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	newGroupByItems := make([]expression.Expression, len(aggPlan.GroupByItems))
+	for i, item := range aggPlan.GroupByItems {
+		newGroupByItems[i] = expression.ColumnSubstitute(item, projPlan.Schema(), projPlan.Exprs)
+	}
+	newAggFuns := make([]*aggregation.AggFuncDesc, len(aggPlan.AggFuncs))
+	for i, aggFun := range aggPlan.AggFuncs {
+		newAggFuns[i] = aggFun.Clone()
+		newArgs := make([]expression.Expression, len(aggFun.Args))
+		for j, arg := range aggFun.Args {
+			newArgs[j] = expression.ColumnSubstitute(arg, projPlan.Schema(), projPlan.Exprs)
+		}
+		newAggFuns[i].Args = newArgs
+	}
+	newAgg := plannercore.LogicalAggregation{
+		AggFuncs:     newAggFuns,
+		GroupByItems: newGroupByItems,
+	}.Init(aggPlan.SCtx())
+	newAggGroupExpr := memo.NewGroupExpr(newAgg)
+	newAggGroupExpr.SetChildren(old.Children[0].GetExpr().Children...)
+	return []*memo.GroupExpr{newAggGroupExpr}, true, false, nil
 }
